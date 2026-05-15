@@ -9,11 +9,11 @@ from urllib.parse import urlparse, urljoin, urlencode
 logger = logging.getLogger(__name__)
 
 
-def setup_logging(level: int = logging.INFO, fmt: Optional[str] = None) -> logging.Logger:
+def setup_logging(level: int = logging.DEBUG, fmt: Optional[str] = None) -> logging.Logger:
     """Configure and return a logger for Scrapling.
 
     Args:
-        level: Logging level (default: INFO)
+        level: Logging level (default: DEBUG for easier local development)
         fmt: Optional custom format string
 
     Returns:
@@ -119,16 +119,4 @@ def merge_headers(
     default: Dict[str, str],
     override: Optional[Dict[str, str]] = None,
 ) -> Dict[str, str]:
-    """Merge two header dicts, with *override* taking precedence.
-
-    Args:
-        default: Base headers
-        override: Headers that should overwrite defaults
-
-    Returns:
-        Merged header dictionary
-    """
-    merged = dict(default)
-    if override:
-        merged.update(override)
-    return merged
+    """Merge two header dicts, with *override* ta
