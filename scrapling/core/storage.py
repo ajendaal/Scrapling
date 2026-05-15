@@ -1,156 +1,127 @@
-from hashlib import sha256
-from threading import RLock
-from functools import lru_cache
-from abc import ABC, abstractmethod
-from sqlite3 import connect as db_connect
+"""Storage backends for Scrapling's adaptive learning and caching capabilities.
 
-from orjson import dumps, loads
-from lxml.html import HtmlElement
+This module provides storage abstractions for persisting element fingerprints
+and caching scraped data across sessions.
+"""
 
-from scrapling.core.utils import _StorageTools, log
-from scrapling.core._types import Dict, Optional, Any, cast
+import os
+import json
+import hashlib
+import logging
+from pathlib import Path
+from typing import Any, Dict, Optional, Union
+from datetime import datetime, timedelta
+
+from scrapling.core.utils import setup_logging
+
+logger = setup_logging()
 
 
-class StorageSystemMixin(ABC):  # pragma: no cover
-    # If you want to make your own storage system, you have to inherit from this
-    def __init__(self, url: Optional[str] = None):
-        """
-        :param url: URL of the website we are working on to separate it from other websites data
-        """
-        # Make the url in lowercase to handle this edge case until it's updated: https://github.com/barseghyanartur/tld/issues/124
-        self.url = url.lower() if (url and isinstance(url, str)) else None
+class StorageBackend:
+    """Abstract base class for storage backends."""
 
-    @lru_cache(64, typed=True)
-    def _get_base_url(self, default_value: str = "default") -> str:
-        if not self.url:
-            return default_value
+    def get(self, key: str) -> Optional[Any]:
+        raise NotImplementedError
 
+    def set(self, key: str, value: Any, ttl: Optional[int] = None) -> bool:
+        raise NotImplementedError
+
+    def delete(self, key: str) -> bool:
+        raise NotImplementedError
+
+    def exists(self, key: str) -> bool:
+        raise NotImplementedError
+
+    def clear(self) -> bool:
+        raise NotImplementedError
+
+
+class FileStorageBackend(StorageBackend):
+    """File-based JSON storage backend for persisting fingerprints and cache.
+
+    Stores data as JSON files in a configurable directory. Supports optional
+    TTL-based expiration for cached entries.
+
+    Args:
+        storage_dir: Directory path where storage files will be written.
+                     Defaults to ~/.scrapling/storage.
+        filename: Name of the JSON file used for storage.
+    """
+
+    def __init__(
+        self,
+        storage_dir: Optional[Union[str, Path]] = None,
+        filename: str = "scrapling_store.json",
+    ):
+        if storage_dir is None:
+            storage_dir = Path.home() / ".scrapling" / "storage"
+        self.storage_dir = Path(storage_dir)
+        self.storage_dir.mkdir(parents=True, exist_ok=True)
+        self.filepath = self.storage_dir / filename
+        self._data: Dict[str, Any] = self._load()
+
+    def _load(self) -> Dict[str, Any]:
+        """Load existing data from the JSON file, returning empty dict on failure."""
+        if not self.filepath.exists():
+            return {}
         try:
-            from tld import get_tld, Result
+            with open(self.filepath, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError) as exc:
+            logger.warning("Failed to load storage file %s: %s", self.filepath, exc)
+            return {}
 
-            # Fixing the inaccurate return type hint in `get_tld`
-            extracted: Result | None = cast(
-                Result, get_tld(self.url, as_object=True, fail_silently=True, fix_protocol=True)
-            )
-            if not extracted:
-                return default_value
-            return extracted.fld or extracted.domain or default_value
-        except AttributeError:
-            return default_value
+    def _save(self) -> bool:
+        """Persist in-memory data to the JSON file."""
+        try:
+            with open(self.filepath, "w", encoding="utf-8") as f:
+                json.dump(self._data, f, indent=2, default=str)
+            return True
+        except OSError as exc:
+            logger.error("Failed to save storage file %s: %s", self.filepath, exc)
+            return False
 
-    @abstractmethod
-    def save(self, element: HtmlElement, identifier: str) -> None:
-        """Saves the element's unique properties to the storage for retrieval and relocation later
+    def _is_expired(self, entry: Dict[str, Any]) -> bool:
+        """Check whether a stored entry has passed its TTL."""
+        expires_at = entry.get("expires_at")
+        if expires_at is None:
+            return False
+        return datetime.utcnow() > datetime.fromisoformat(expires_at)
 
-        :param element: The element itself which we want to save to storage.
-        :param identifier: This is the identifier that will be used to retrieve the element later from the storage. See
-            the docs for more info.
-        """
-        raise NotImplementedError("Storage system must implement `save` method")
-
-    @abstractmethod
-    def retrieve(self, identifier: str) -> Optional[Dict]:
-        """Using the identifier, we search the storage and return the unique properties of the element
-
-        :param identifier: This is the identifier that will be used to retrieve the element from the storage. See
-            the docs for more info.
-        :return: A dictionary of the unique properties
-        """
-        raise NotImplementedError("Storage system must implement `save` method")
-
-    @staticmethod
-    @lru_cache(128, typed=True)
-    def _get_hash(identifier: str) -> str:
-        """If you want to hash identifier in your storage system, use this safer"""
-        _identifier = identifier.lower().strip()
-        # Hash functions have to take bytes
-        _identifier_bytes = _identifier.encode("utf-8")
-
-        hash_value = sha256(_identifier_bytes).hexdigest()
-        return f"{hash_value}_{len(_identifier_bytes)}"  # Length to reduce collision chance
-
-
-@lru_cache(1, typed=True)
-class SQLiteStorageSystem(StorageSystemMixin):
-    """The recommended system to use, it's race condition safe and thread safe.
-    Mainly built, so the library can run in threaded frameworks like scrapy or threaded tools
-    > It's optimized for threaded applications, but running it without threads shouldn't make it slow."""
-
-    def __init__(self, storage_file: str, url: Optional[str] = None):
-        """
-        :param storage_file: File to be used to store elements' data.
-        :param url: URL of the website we are working on to separate it from other websites data
-
-        """
-        super().__init__(url)
-        self.storage_file = storage_file
-        self.lock = RLock()  # Better than Lock for reentrancy
-        # >SQLite default mode in the earlier version is 1 not 2 (1=thread-safe 2=serialized)
-        # `check_same_thread=False` to allow it to be used across different threads.
-        self.connection = db_connect(self.storage_file, check_same_thread=False)
-        # WAL (Write-Ahead Logging) allows for better concurrency.
-        self.connection.execute("PRAGMA journal_mode=WAL")
-        self.cursor = self.connection.cursor()
-        self._setup_database()
-        log.debug(f'Storage system loaded with arguments (storage_file="{storage_file}", url="{url}")')
-
-    def _setup_database(self) -> None:
-        self.cursor.execute("""
-            CREATE TABLE IF NOT EXISTS storage (
-                id INTEGER PRIMARY KEY,
-                url TEXT,
-                identifier TEXT,
-                element_data TEXT,
-                UNIQUE (url, identifier)
-            )
-        """)
-        self.connection.commit()
-
-    def save(self, element: HtmlElement, identifier: str) -> None:
-        """Saves the elements unique properties to the storage for retrieval and relocation later
-
-        :param element: The element itself which we want to save to storage.
-        :param identifier: This is the identifier that will be used to retrieve the element later from the storage. See
-            the docs for more info.
-        """
-        url = self._get_base_url()
-        element_data = _StorageTools.element_to_dict(element)
-        with self.lock:
-            self.cursor.execute(
-                """
-                INSERT OR REPLACE INTO storage (url, identifier, element_data)
-                VALUES (?, ?, ?)
-            """,
-                (url, identifier, dumps(element_data)),
-            )
-            self.cursor.fetchall()
-            self.connection.commit()
-
-    def retrieve(self, identifier: str) -> Optional[Dict[str, Any]]:
-        """Using the identifier, we search the storage and return the unique properties of the element
-
-        :param identifier: This is the identifier that will be used to retrieve the element from the storage. See
-            the docs for more info.
-        :return: A dictionary of the unique properties
-        """
-        url = self._get_base_url()
-        with self.lock:
-            self.cursor.execute(
-                "SELECT element_data FROM storage WHERE url = ? AND identifier = ?",
-                (url, identifier),
-            )
-            result = self.cursor.fetchone()
-            if result:
-                return loads(result[0])
+    def get(self, key: str) -> Optional[Any]:
+        """Retrieve a value by key, respecting TTL expiration."""
+        entry = self._data.get(key)
+        if entry is None:
             return None
+        if self._is_expired(entry):
+            self.delete(key)
+            return None
+        return entry.get("value")
 
-    def close(self):
-        """Close all connections. It will be useful when with some things like scrapy Spider.closed() function/signal"""
-        with self.lock:
-            self.connection.commit()
-            self.cursor.close()
-            self.connection.close()
+    def set(self, key: str, value: Any, ttl: Optional[int] = None) -> bool:
+        """Store a value under the given key with an optional TTL in seconds."""
+        entry: Dict[str, Any] = {"value": value, "created_at": datetime.utcnow().isoformat()}
+        if ttl is not None:
+            expires_at = datetime.utcnow() + timedelta(seconds=ttl)
+            entry["expires_at"] = expires_at.isoformat()
+        self._data[key] = entry
+        return self._save()
 
-    def __del__(self):
-        """To ensure all connections are closed when the object is destroyed."""
-        self.close()
+    def delete(self, key: str) -> bool:
+        """Remove an entry by key."""
+        if key in self._data:
+            del self._data[key]
+            return self._save()
+        return False
+
+    def exists(self, key: str) -> bool:
+        """Return True if the key exists and has not expired."""
+        return self.get(key) is not None
+
+    def clear(self) -> bool:
+        """Remove all stored entries."""
+        self._data = {}
+        return self._save()
+
+    def __repr__(self) -> str:
+        return f"FileStorageBackend(path={self.filepath!r}, entries={len(self._data)})"
