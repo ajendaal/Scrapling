@@ -38,7 +38,7 @@ class BaseFetcher(ABC):
 
     def __init__(
         self,
-        timeout: int = 30,
+        timeout: int = 60,  # increased from 30 — 30s was too aggressive for slow sites
         retries: int = 3,
         headers: Optional[Dict[str, str]] = None,
         proxy: Optional[str] = None,
@@ -107,18 +107,4 @@ class StorageMixin:
 
     def store(self, key: str, value: Any) -> None:
         """Store a value under the given key."""
-        self._cache[key] = value
-
-    def retrieve(self, key: str, default: Any = None) -> Any:
-        """Retrieve a stored value, returning *default* if not found."""
-        return self._cache.get(key, default)
-
-    def clear_cache(self) -> None:
-        """Clear all cached entries."""
-        self._cache.clear()
-        logger.debug("Storage cache cleared.")
-
-    @property
-    def cache_size(self) -> int:
-        """Return the number of entries currently in the cache."""
-        return len(self._cache)
+        
