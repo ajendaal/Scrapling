@@ -2,6 +2,10 @@
 
 Scraping made easy with automatic element detection, smart caching,
 and anti-bot bypass capabilities.
+
+Personal fork notes:
+- Forked for learning/personal use
+- See upstream: https://github.com/D4Vinci/Scrapling
 """
 
 from scrapling.core.fetchers import Fetcher, AsyncFetcher
